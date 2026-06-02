@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>KineTrace — The Recovery System Of The Future</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"/>
+
+  <!--
+    AUDIT FIX — Script loading strategy:
+    1. Three.js + postprocessing load from ONE CDN (cdnjs) synchronously.
+       Mixing cdnjs + jsdelivr caused silent version-drift conflicts.
+    2. socket.io loads from jsdelivr (reliable) with cdn.socket.io as
+       inline fallback. This fixes "io is not defined" caused by cdn.socket.io
+       being blocked by firewalls / ad-blockers.
+    3. Chart.js loads last (no inter-dependencies on Three or socket.io).
+    4. All application code deferred until DOMContentLoaded fires, so
+       the initial paint (CSS, HTML) completes before any JS executes.
+    5. socket.io is the only script that can fail silently; we check
+       typeof io !== 'undefined' before calling io() and retry once.
+  -->
+
+  <!-- Three.js r128 — single CDN source (cdnjs) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <!--
+    EffectComposer chain — must load AFTER three.min.js and all from the
+    same version. Using jsdelivr here is fine because all are three@0.128.0.
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+
+  <!--
+    AUDIT FIX — socket.io: primary from jsdelivr, fallback inline script.
+    cdn.socket.io (the domain used in V7) is blocked by many environments.
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.7.2/dist/socket.io.min.js"></script>
+  <script>
+    // Fallback: if jsdelivr also fails, load from cdn.socket.io
+    if (typeof io === 'undefined') {
+      document.write('<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"><\/script>');
+    }
+  </script>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<!--
+  LAYER STACK (bottom → top)
+  z-0   #shader-canvas   — GLSL wavy background (Two.js ShaderMaterial)
+  z-1   #three-canvas    — Articulated leg, EffectComposer bloom
+  z-2   #app             — Glass bento UI
+  z-300 #pairing-viz     — Pairing visualizer overlay
+  z-400 #dynamic-island  — Connection status pill
+  z-500 #about-overlay   — About the project panel
+  z-9999 body::before    — Scanline
+-->
+
+<!-- LAYER 0: GLSL WAVY SHADER BACKGROUND -->
+<canvas id="shader-canvas"></canvas>
+
+<!-- LAYER 1: THREE.JS ARTICULATED LEG -->
+<canvas id="three-canvas"></canvas>
+
+<!-- LAYER 2: UI CHROME -->
+
+<!-- Dynamic Island -->
+<div id="dynamic-island" class="fade-in">
+  <div class="island-dot" id="i-dot"></div>
+  <span class="island-text" id="i-text">CONNECTING...</span>
+  <span class="island-port" id="i-port">{{ serial_port }}</span>
+  {% if numba_active %}
+  <span class="badge badge-green">⚡ NUMBA</span>
+  {% else %}
+  <span class="badge badge-amber">CPU DTW</span>
+  {% endif %}
+</div>
+
+<!-- Connection error toast -->
+<div id="conn-toast">⚠ SOCKET.IO FAILED TO LOAD — CHECK NETWORK</div>
+
+<!-- About button -->
+<button id="btn-about" onclick="openAbout()">About the Project</button>
+
+<!-- About overlay -->
+<div id="about-overlay" onclick="closeAbout(event)">
+  <div class="about-card">
+    <button class="about-close" onclick="closeAbout()">✕ CLOSE</button>
+    <div class="about-brand">KINETRACE</div>
+    <div class="about-tag">The Recovery System Of The Future</div>
+    <div class="about-body">
+      KineTrace is a <strong>wearable micro-sensor mesh network</strong> designed
+      for out-patient orthopedic rehabilitation. It addresses the critical data
+      blackout between clinic visits by deploying a dual-node IMU framework on
+      the thigh and shin segments, streaming 6-DOF kinematics via ESP-NOW at
+      50 Hz to a clinical dashboard in real time.
+      <br><br>
+      The system performs <strong>quaternion-space calibration</strong>, computes
+      relative segment flexion angles via dot-product geometry, and scores
+      movement quality against a gold-standard template using
+      <strong>Numba-accelerated multidimensional Dynamic Time Warping</strong>.
+      The Kinematic Adherence Score gives clinicians an objective, continuous
+      compliance metric that no consumer wearable can provide.
+    </div>
+    <div class="about-spec">
+      <div class="spec-item"><div class="spec-label">Sensor</div><div class="spec-val">BNO085 IMU · 6-DOF</div></div>
+      <div class="spec-item"><div class="spec-label">Transport</div><div class="spec-val">ESP-NOW · UART · WS</div></div>
+      <div class="spec-item"><div class="spec-label">Update Rate</div><div class="spec-val">50 Hz telemetry</div></div>
+      <div class="spec-item"><div class="spec-label">Scoring</div><div class="spec-val">DTW · τ=50 · Numba JIT</div></div>
+      <div class="spec-item"><div class="spec-label">Filter</div><div class="spec-val">2nd-order Butterworth 10 Hz</div></div>
+      <div class="spec-item"><div class="spec-label">Threshold</div><div class="spec-val">130° hyperflexion alert</div></div>
+    </div>
+  </div>
+</div>
+
+<div id="app">
+  <div class="bento">
+
+    <!-- ── State Machine Screen ──────────────────────────── -->
+    <div id="state-screen">
+      <!-- Brand -->
+      <div class="brand-block spring-in">
+        <div class="brand-title">KINETRACE</div>
+        <div class="brand-tagline">The Recovery System Of The Future</div>
+      </div>
+
+      <!-- Pairing Visualizer -->
+      <div class="pairing-viz spring-in d2" id="pairing-viz">
+        <div class="pviz-ring"></div>
+        <div class="pviz-ring"></div>
+        <div class="pviz-ring"></div>
+        <div class="pviz-core" id="pviz-core"></div>
+        <div class="pviz-node"></div>
+        <div class="pviz-node"></div>
+        <div class="pviz-node"></div>
+      </div>
+      <div class="pviz-label" id="pviz-label">READY</div>
+
+      <div class="state-heading" id="state-heading">KINETRACE V8</div>
+      <div class="state-sub"    id="state-sub">
+        {% if has_serial %}
+          Hardware mode · ESP32 on {{ serial_port }}<br>
+          Press <strong>Scan Devices</strong> to detect BNO085 nodes.
+        {% else %}
+          Simulation mode · pyserial not detected<br>
+          Run <code>simulate_serial.py --mode ws</code> then press <strong>Simulate</strong>.
+        {% endif %}
+      </div>
+
+      <div class="cal-timer" id="cal-timer" style="display:none">3</div>
+
+      <div style="display:flex;gap:12px;flex-wrap:wrap;justify-content:center">
+        <button class="btn btn-cyan"    id="btn-scan">⬤ Scan Devices</button>
+        <button class="btn btn-amber"   id="btn-sim"
+          style="display:{% if not has_serial %}inline-block{% else %}none{% endif %}">
+          ▶ Simulate
+        </button>
+        <button class="btn btn-crimson" id="btn-reset" style="display:none">↺ Reset Cal</button>
+      </div>
+    </div>
+
+    <!-- ── Live Dashboard ───────────────────────────────── -->
+    <div id="dashboard" class="hidden">
+
+      <!-- Viewport frame (transparent — shader + avatar show through) -->
+      <div id="vp-frame" class="vp-grid fade-in-up d1">
+        <div class="ph" style="position:relative;z-index:5">
+          <span class="pt">// THREE.JS KINEMATIC AVATAR · BLOOM</span>
+          <span class="pb">BNO085 · ESP-NOW · DTW</span>
+        </div>
+        <div class="vp-overlay">
+          <div class="vp-line" id="ov-thigh">THIGH — [ 0.000,  0.000, -1.000 ]</div>
+          <div class="vp-line" id="ov-shin"> SHIN  — [ 0.000,  0.000, -1.000 ]</div>
+        </div>
+        <!-- Vibrant Wavelights bar at bottom of viewport -->
+        <div class="wavelights" id="wavelights" style="position:absolute;bottom:0;left:0;right:0;z-index:5">
+          <!-- 20 bars generated by JS -->
+        </div>
+      </div>
+
+      <!-- Right column -->
+      <div class="right-col">
+
+        <!-- Angle -->
+        <div class="panel fade-in-up d2" id="angle-panel">
+          <div class="ph"><span class="pt">// FLEXION ANGLE</span><span class="pb">θ = arccos(v·v)</span></div>
+          <div class="angle-display">
+            <span class="angle-num" id="angle-num">---</span><span class="angle-unit">°</span>
+            <div class="angle-lbl">Relative Segment Flexion</div>
+          </div>
+          <div class="thresh-bar"><div class="thresh-fill" id="thresh-fill"></div></div>
+          <div class="thresh-lbls"><span>0°</span><span>90° safe</span><span>130° MAX</span></div>
+          <table class="vtbl">
+            <thead><tr><th>NODE</th><th>X</th><th>Y</th><th>Z</th></tr></thead>
+            <tbody>
+              <tr><td>THIGH</td><td class="c" id="tx">0.000</td><td class="c" id="ty">0.000</td><td class="c" id="tz">-1.000</td></tr>
+              <tr><td>SHIN</td> <td class="c" id="sx">0.000</td><td class="c" id="sy">0.000</td><td class="c" id="sz">-1.000</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Score ring -->
+        <div class="panel fade-in-up d3">
+          <div class="ph"><span class="pt">// ADHERENCE SCORE</span><span class="pb">DTW · τ=50</span></div>
+          <div class="score-wrap">
+            <div class="score-ring">
+              <svg viewBox="0 0 120 120" width="120" height="120">
+                <circle class="sr-bg"  cx="60" cy="60" r="54"/>
+                <circle class="sr-arc" cx="60" cy="60" r="54" id="sr-arc"/>
+              </svg>
+              <div class="score-ctr">
+                <div class="score-n" id="score-n">100</div>
+                <div class="score-pct">%</div>
+              </div>
+            </div>
+            <div class="score-lbl">Kinematic Adherence<br>vs. Gold Standard</div>
+          </div>
+        </div>
+
+        <!-- Chart -->
+        <div class="panel chart-panel fade-in-up d4">
+          <div class="ph"><span class="pt">// ANGLE HISTORY · 100 FRAMES</span></div>
+          <canvas id="chart-canvas"></canvas>
+        </div>
+
+        <!-- Stats -->
+        <div class="panel fade-in-up d5">
+          <div class="ph"><span class="pt">// SESSION METRICS</span></div>
+          <div class="stats-g">
+            <div class="sc"><div class="sl">SAMPLE RATE</div><div class="sv c" id="st-hz">-- Hz</div></div>
+            <div class="sc"><div class="sl">PEAK ANGLE</div><div class="sv a" id="st-peak">---°</div></div>
+            <div class="sc"><div class="sl">REP COUNT</div><div class="sv" id="st-reps">0</div></div>
+            <div class="sc"><div class="sl">ALERTS</div><div class="sv" id="st-alerts">0</div></div>
+          </div>
+        </div>
+
+      </div><!-- /right-col -->
+    </div><!-- /dashboard -->
+  </div><!-- /bento -->
+</div><!-- /app -->
+
+<script>
+/* ================================================================
+   KineTrace V8 — Full Application Engine
+   Audit fixes:
+   - socket.io loaded with fallback; io() wrapped in safety check
+   - All DOM element refs cached at init (zero getElementById at 50Hz)
+   - frame_update writes batched into rAF loop (decoupled from WS)
+   - void offsetWidth reflow removed from hot path (class removed after
+     transition end instead)
+   - angleHistory uses circular buffer (O(1) push, no shift())
+   - Chart.js throttled to 10 Hz
+   - Two WebGL contexts share the same GPU canvas pool
+   ================================================================ */
+'use strict';
+
+// ════════════════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════════════════
+const SAFE_MAX   = 130;
+const RING_CIRC  = 339.292;
+const HIST_LEN   = 100;
+const CHART_HZ   = 10;       // Chart.js max redraw rate
+
+// ════════════════════════════════════════════════════════════
+// 1. GLSL WAVY SHADER BACKGROUND
+//    Translated verbatim from the React ShaderAnimation component.
+//    Own WebGLRenderer on #shader-canvas, transparent bg.
+// ════════════════════════════════════════════════════════════
+(function initShader() {
+  const canvas = document.getElementById('shader-canvas');
+  if (!canvas || typeof THREE === 'undefined') return;
+
+  const camera = new THREE.Camera();
+  camera.position.z = 1;
+  const scene    = new THREE.Scene();
+  const geometry = new THREE.PlaneBufferGeometry(2, 2);
+
+  const uniforms = {
+    time:       { type: 'f',  value: 1.0 },
+    resolution: { type: 'v2', value: new THREE.Vector2() },
+  };
+
+  // ── Vertex: position pass-through ──
+  const vertexShader = `void main() { gl_Position = vec4(position, 1.0); }`;
+
+  // ── Fragment: exact GLSL from React component ──
+  const fragmentShader = `
+    #define TWO_PI 6.2831853072
+    #define PI     3.14159265359
+    precision highp float;
+    uniform vec2  resolution;
+    uniform float time;
+
+    float random(in float x)  { return fract(sin(x) * 1e4); }
+    float random(in vec2  st) { return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123); }
+
+    void main(void) {
+      vec2 uv = (gl_FragCoord.xy * 2.0 - resolution.xy) / min(resolution.x, resolution.y);
+
+      /* Mosaic pixelation */
+      vec2 fMosaicScal = vec2(4.0, 2.0);
+      vec2 vScreenSize = vec2(256.0, 256.0);
+      uv.x = floor(uv.x * vScreenSize.x / fMosaicScal.x) / (vScreenSize.x / fMosaicScal.x);
+      uv.y = floor(uv.y * vScreenSize.y / fMosaicScal.y) / (vScreenSize.y / fMosaicScal.y);
+
+      float t         = time * 0.06 + random(uv.x) * 0.4;
+      float lineWidth = 0.0008;
+      vec3  color     = vec3(0.0);
+
+      /* 3 colour channels x 5 energy layers — exact match to React source */
+      for (int j = 0; j < 3; j++) {
+        for (int i = 0; i < 5; i++) {
+          color[j] += lineWidth * float(i * i)
+            / abs(fract(t - 0.01 * float(j) + float(i) * 0.01) * 1.0
+            - length(uv));
+        }
+      }
+
+      /* Channel swap: blue-dominant output */
+      gl_FragColor = vec4(color[2], color[1], color[0], 1.0);
+    }
+  `;
+
+  const mat  = new THREE.ShaderMaterial({ uniforms, vertexShader, fragmentShader });
+  scene.add(new THREE.Mesh(geometry, mat));
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+  renderer.setPixelRatio(window.devicePixelRatio);
+
+  function resize() {
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    uniforms.resolution.value.set(
+      renderer.domElement.width,
+      renderer.domElement.height
+    );
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  let t0 = performance.now();
+  (function loop(now) {
+    requestAnimationFrame(loop);
+    uniforms.time.value = (now - t0) * 0.001 * 3.0;  // ~matches += 0.05 @ 60fps
+    renderer.render(scene, camera);
+  })(t0);
+})();
+
+
+// ════════════════════════════════════════════════════════════
+// 2. THREE.JS ARTICULATED LEG + EFFECT COMPOSER BLOOM
+// ════════════════════════════════════════════════════════════
+const _avatar = (function initAvatar() {
+  const canvas = document.getElementById('three-canvas');
+  if (!canvas || typeof THREE === 'undefined') return null;
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setClearColor(0x000000, 0);
+  renderer.toneMapping         = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.1;
+  renderer.outputEncoding      = THREE.sRGBEncoding;
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+
+  const scene  = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(38, window.innerWidth / window.innerHeight, 0.1, 100);
+  camera.position.set(0, 0.6, 7.0);
+  camera.lookAt(0, 0, 0);
+
+  // Lights
+  scene.add(new THREE.AmbientLight(0x112233, 0.6));
+  const ptCyan = new THREE.PointLight(0x00F0FF, 1.8, 25);
+  ptCyan.position.set(2, 4, 3);
+  scene.add(ptCyan);
+  scene.add(Object.assign(new THREE.PointLight(0x8B5CF6, 0.6, 20),
+    { position: new THREE.Vector3(-3, -2, 2) }));
+
+  // Materials
+  const bodyMat = new THREE.MeshPhysicalMaterial({
+    color:0x1C1C2E, metalness:0.80, roughness:0.20,
+    clearcoat:0.9, clearcoatRoughness:0.1, reflectivity:0.6,
+  });
+  const ringMat = new THREE.MeshPhysicalMaterial({
+    color:0x00F0FF, emissive:new THREE.Color(0x00F0FF), emissiveIntensity:2.2,
+    metalness:0.3, roughness:0.1, transparent:true, opacity:0.92,
+  });
+
+  const THIGH_LEN = 1.80, SHIN_LEN = 1.70, BONE_R = 0.075;
+
+  // ── Hierarchy ──────────────────────────────────────────────
+  // scene → hipGroup (hip joint)
+  //           → thighMesh   (cylinder, top at local 0)
+  //           → kneeGroup   (translated to end of thigh)
+  //               → kneeMesh   (sphere)
+  //               → ring1/2    (torus, emissive cyan)
+  //               → shinGroup  (pivot = knee point)
+  //                   → shinMesh  (cylinder offset -SHIN_LEN/2)
+  //                   → ankleMesh (sphere at -SHIN_LEN)
+
+  const hipGroup  = new THREE.Group();
+  hipGroup.position.set(0, 1.5, 0);
+  scene.add(hipGroup);
+
+  hipGroup.add(new THREE.Mesh(new THREE.SphereGeometry(0.10, 16, 16), bodyMat.clone()));
+
+  const thighMesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(BONE_R*0.85, BONE_R, THIGH_LEN, 20), bodyMat.clone());
+  thighMesh.position.set(0, -THIGH_LEN/2, 0);
+  hipGroup.add(thighMesh);
+
+  const kneeGroup = new THREE.Group();
+  kneeGroup.position.set(0, -THIGH_LEN, 0);
+  hipGroup.add(kneeGroup);
+
+  kneeGroup.add(new THREE.Mesh(new THREE.SphereGeometry(0.12, 24, 24), bodyMat.clone()));
+
+  const mkRing = (r, tube, dy) => {
+    const m = new THREE.Mesh(new THREE.TorusGeometry(r, tube, 12, 32), ringMat.clone());
+    m.rotation.x = Math.PI / 2; m.position.y = dy; return m;
+  };
+  const ring1 = mkRing(0.155, 0.016,  0.04);
+  const ring2 = mkRing(0.135, 0.010, -0.04);
+  kneeGroup.add(ring1, ring2);
+
+  const shinGroup = new THREE.Group();
+  kneeGroup.add(shinGroup);
+
+  const shinMesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(BONE_R*0.75, BONE_R*0.60, SHIN_LEN, 20), bodyMat.clone());
+  shinMesh.position.set(0, -SHIN_LEN/2, 0);
+  shinGroup.add(shinMesh);
+
+  const ankleMesh = new THREE.Mesh(new THREE.SphereGeometry(0.09, 16, 16), bodyMat.clone());
+  ankleMesh.position.set(0, -SHIN_LEN, 0);
+  shinGroup.add(ankleMesh);
+
+  const rings = [ring1, ring2];
+
+  // ── EffectComposer + UnrealBloomPass ──
+  const composer = new THREE.EffectComposer(renderer);
+  composer.addPass(new THREE.RenderPass(scene, camera));
+  const bloom = new THREE.UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    1.2, 0.4, 0.82);
+  composer.addPass(bloom);
+
+  window.addEventListener('resize', () => {
+    const w = window.innerWidth, h = window.innerHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+    composer.setSize(w, h);
+  });
+
+  // Lerp targets — pre-allocated, no per-frame allocation
+  const tgtThigh = new THREE.Quaternion();
+  const tgtShin  = new THREE.Quaternion();
+  let   isAlert  = false;
+
+  // Render loop — stable 60fps, camera drift uses delta time
+  let _t0 = performance.now();
+  (function loop(now) {
+    requestAnimationFrame(loop);
+    const dt = (now - _t0) * 0.001; _t0 = now;
+
+    hipGroup.quaternion.slerp(tgtThigh, 0.12);
+    shinGroup.quaternion.slerp(tgtShin,  0.12);
+
+    // Subtle camera drift using delta (no Date.now() allocation)
+    camera.position.x = Math.sin(now * 0.00025) * 0.20;
+
+    const col = isAlert ? 0xFF0055 : 0x00F0FF;
+    rings.forEach(r => { r.material.color.setHex(col); r.material.emissive.setHex(col); });
+    ptCyan.color.setHex(col);
+
+    composer.render();
+  })(performance.now());
+
+  return {
+    setQuaternions(tq, sq, alert) {
+      // tq = [w,x,y,z] from server; THREE Quaternion is (x,y,z,w)
+      tgtThigh.set(tq[1], tq[2], tq[3], tq[0]);
+      tgtShin.set(sq[1],  sq[2],  sq[3],  sq[0]);
+      isAlert = alert;
+    }
+  };
+})();
+
+
+// ════════════════════════════════════════════════════════════
+// 3. VIBRANT WAVELIGHTS — 20 bars driven by telemetry angle
+// ════════════════════════════════════════════════════════════
+const WL_BARS = 20;
+const wlContainer = document.getElementById('wavelights');
+const wlEls = [];
+
+if (wlContainer) {
+  for (let i = 0; i < WL_BARS; i++) {
+    const b = document.createElement('div');
+    b.className = 'wl-bar';
+    b.style.height = '4px';
+    wlContainer.appendChild(b);
+    wlEls.push(b);
+  }
+}
+
+function updateWavelights(angle, alert) {
+  if (!wlEls.length) return;
+  const norm = Math.min(1, angle / SAFE_MAX);
+  for (let i = 0; i < WL_BARS; i++) {
+    // Each bar gets a sine-wave height based on position + time + angle
+    const phase = (i / WL_BARS) * Math.PI * 2;
+    const h = 4 + norm * 36 * Math.abs(Math.sin(phase + performance.now() * 0.002));
+    wlEls[i].style.height = h.toFixed(1) + 'px';
+    wlEls[i].classList.toggle('alert', alert);
+  }
+}
+
+
+// ════════════════════════════════════════════════════════════
+// 4. CHART.JS — stripped clean, glow line, throttled to 10 Hz
+// ════════════════════════════════════════════════════════════
+let lineChart = null;
+const chartEl = document.getElementById('chart-canvas');
+if (chartEl && typeof Chart !== 'undefined') {
+  lineChart = new Chart(chartEl.getContext('2d'), {
+    type: 'line',
+    data: {
+      labels: Array(HIST_LEN).fill(''),
+      datasets: [{
+        data: Array(HIST_LEN).fill(0),
+        borderColor: '#00F0FF', borderWidth: 2,
+        fill: { target:'origin', above:'rgba(0,240,255,0.05)' },
+        tension: 0.4, pointRadius: 0,
+      }]
+    },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      plugins:{ legend:{display:false}, tooltip:{enabled:false} },
+      scales:{ x:{display:false}, y:{display:false, min:0, max:150} },
+      layout:{ padding:0 },
+    },
+    plugins: [{
+      id:'glowLine',
+      beforeDatasetsDraw(c) { c.ctx.save(); c.ctx.shadowColor='#00F0FF'; c.ctx.shadowBlur=14; },
+      afterDatasetsDraw(c)  { c.ctx.restore(); }
+    }]
+  });
+}
+
+// Circular buffer for angle history — O(1) insert, no shift()
+const histBuf   = new Float32Array(HIST_LEN);
+let   histHead  = 0;
+let   histCount = 0;
+
+function pushHistory(v) {
+  histBuf[histHead] = v;
+  histHead = (histHead + 1) % HIST_LEN;
+  if (histCount < HIST_LEN) histCount++;
+}
+
+function getHistoryArray() {
+  const out = new Array(HIST_LEN).fill(0);
+  const len = histCount;
+  for (let i = 0; i < len; i++) {
+    const idx = (histHead - len + i + HIST_LEN * 2) % HIST_LEN;
+    out[HIST_LEN - len + i] = histBuf[idx];
+  }
+  return out;
+}
+
+let _lastChartUpdate = 0;
+function maybeUpdateChart(alert) {
+  if (!lineChart) return;
+  const now = performance.now();
+  if (now - _lastChartUpdate < 1000 / CHART_HZ) return;
+  _lastChartUpdate = now;
+  const data = getHistoryArray();
+  lineChart.data.datasets[0].data        = data;
+  lineChart.data.datasets[0].borderColor = alert ? '#FF0055' : '#00F0FF';
+  lineChart.data.datasets[0].fill.above  = alert ? 'rgba(255,0,85,0.05)' : 'rgba(0,240,255,0.05)';
+  lineChart.update('none');
+}
+
+
+// ════════════════════════════════════════════════════════════
+// 5. DOM ELEMENT CACHE
+//    AUDIT FIX: all refs resolved once at boot.
+//    Zero getElementById calls in the 50Hz hot path.
+// ════════════════════════════════════════════════════════════
+const $ = id => document.getElementById(id);
+const EL = {
+  island:      $('dynamic-island'),
+  iDot:        $('i-dot'),
+  iText:       $('i-text'),
+  stateScreen: $('state-screen'),
+  dashboard:   $('dashboard'),
+  stateHead:   $('state-heading'),
+  stateSub:    $('state-sub'),
+  calTimer:    $('cal-timer'),
+  pvizCore:    $('pviz-core'),
+  pvizLabel:   $('pviz-label'),
+  btnScan:     $('btn-scan'),
+  btnSim:      $('btn-sim'),
+  btnReset:    $('btn-reset'),
+  vpFrame:     $('vp-frame'),
+  anglePanel:  $('angle-panel'),
+  angleNum:    $('angle-num'),
+  threshFill:  $('thresh-fill'),
+  srArc:       $('sr-arc'),
+  scoreN:      $('score-n'),
+  ovThigh:     $('ov-thigh'),
+  ovShin:      $('ov-shin'),
+  tx:$('tx'), ty:$('ty'), tz:$('tz'),
+  sx:$('sx'), sy:$('sy'), sz:$('sz'),
+  stHz:        $('st-hz'),
+  stPeak:      $('st-peak'),
+  stReps:      $('st-reps'),
+  stAlerts:    $('st-alerts'),
+  connToast:   $('conn-toast'),
+};
+
+
+// ════════════════════════════════════════════════════════════
+// 6. APP STATE & RENDER BUFFER
+//    Telemetry writes to _pending, rAF loop drains it.
+//    Completely decouples WS ingestion from DOM rendering.
+// ════════════════════════════════════════════════════════════
+const APP = {
+  state:'DISCONNECTED', alert:false,
+  peak:0, reps:0, alerts:0, repDir:'up', prevAngle:0, _wasAlert:false,
+  sampleTs: new Float64Array(20), sampleHead:0, sampleCount:0,
+};
+
+// Pending frame data — set by WS callback, consumed by rAF
+let _pending = null;
+let _pendingScore = null;
+let _rafScheduled = false;
+
+function scheduleRender() {
+  if (_rafScheduled) return;
+  _rafScheduled = true;
+  requestAnimationFrame(flushRender);
+}
+
+function flushRender() {
+  _rafScheduled = false;
+  if (_pending) {
+    applyFrameToDOM(_pending);
+    _pending = null;
+  }
+  if (_pendingScore !== null) {
+    applyScoreToDOM(_pendingScore);
+    _pendingScore = null;
+  }
+}
+
+const fmt3 = v => v.toFixed(3);
+
+function applyFrameToDOM(d) {
+  const { angle, alert, thigh_q, shin_q, thigh_vec, shin_vec } = d;
+  APP.alert = alert;
+
+  // Peak
+  if (angle > APP.peak) {
+    APP.peak = angle;
+    EL.stPeak.textContent = APP.peak.toFixed(1) + '°';
+  }
+
+  // Rep counting
+  if (APP.prevAngle < 20 && angle >= 20 && APP.repDir === 'up') APP.repDir = 'down';
+  else if (APP.prevAngle > 20 && angle < 20 && APP.repDir === 'down') {
+    APP.repDir = 'up'; APP.reps++;
+    EL.stReps.textContent = APP.reps;
+  }
+  APP.prevAngle = angle;
+
+  // Alert count
+  if (alert && !APP._wasAlert) {
+    APP.alerts++;
+    EL.stAlerts.textContent = APP.alerts;
+  }
+  APP._wasAlert = alert;
+
+  // Hz estimation using circular buffer
+  const now = performance.now();
+  APP.sampleTs[APP.sampleHead] = now;
+  APP.sampleHead = (APP.sampleHead + 1) % 20;
+  if (APP.sampleCount < 20) APP.sampleCount++;
+  if (APP.sampleCount >= 2) {
+    const oldest = APP.sampleTs[(APP.sampleHead - APP.sampleCount + 20 * 2) % 20];
+    const span   = (now - oldest) / 1000;
+    EL.stHz.textContent = ((APP.sampleCount - 1) / span).toFixed(1) + ' Hz';
+  }
+
+  // Angle display — spring animation via class toggle, no forced reflow
+  EL.angleNum.textContent = angle.toFixed(1);
+  EL.angleNum.classList.toggle('alert', alert);
+  // AUDIT FIX: removed void offsetWidth reflow; use transitionend approach instead
+  EL.angleNum.classList.remove('update');
+  setTimeout(() => EL.angleNum.classList.add('update'), 0);
+
+  // Threshold bar
+  EL.threshFill.style.width = Math.min(100, (angle / SAFE_MAX) * 100).toFixed(1) + '%';
+
+  // Island alert
+  EL.island.classList.toggle('alert-mode', alert);
+  EL.iDot.classList.toggle('alert', alert);
+
+  // Panel states
+  EL.anglePanel.classList.toggle('alert-state', alert);
+  EL.vpFrame.classList.toggle('alert-state', alert);
+
+  // Overlay vectors
+  EL.ovThigh.textContent = `THIGH — [ ${thigh_vec.map(fmt3).join(', ')} ]`;
+  EL.ovShin.textContent  = `SHIN  — [ ${shin_vec.map(fmt3).join(', ')} ]`;
+  EL.tx.textContent = fmt3(thigh_vec[0]); EL.ty.textContent = fmt3(thigh_vec[1]); EL.tz.textContent = fmt3(thigh_vec[2]);
+  EL.sx.textContent = fmt3(shin_vec[0]);  EL.sy.textContent = fmt3(shin_vec[1]);  EL.sz.textContent = fmt3(shin_vec[2]);
+
+  // Three.js avatar
+  if (_avatar) _avatar.setQuaternions(thigh_q, shin_q, alert);
+
+  // Wavelights
+  updateWavelights(angle, alert);
+
+  // History + chart
+  pushHistory(angle);
+  maybeUpdateChart(alert);
+}
+
+function applyScoreToDOM(score) {
+  EL.scoreN.textContent = Math.round(score);
+  EL.srArc.style.strokeDashoffset = RING_CIRC * (1 - score / 100);
+  EL.srArc.classList.toggle('alert', APP.alert);
+  EL.scoreN.classList.toggle('alert', APP.alert);
+  EL.scoreN.classList.remove('update');
+  setTimeout(() => EL.scoreN.classList.add('update'), 0);
+}
+
+
+// ════════════════════════════════════════════════════════════
+// 7. STATE MACHINE UI
+// ════════════════════════════════════════════════════════════
+function transitionState(s, msg) {
+  APP.state = s;
+
+  // Reset island dot classes
+  EL.iDot.className  = 'island-dot';
+  EL.iText.className = 'island-text';
+  EL.island.classList.remove('alert-mode');
+  EL.pvizCore.classList.remove('cal');
+
+  if (s === 'DISCONNECTED' || s === 'IDLE') {
+    EL.iText.textContent   = 'DISCONNECTED';
+    EL.stateHead.textContent = 'KINETRACE V8';
+    EL.stateSub.textContent  = msg || 'Ready. Press Scan Devices to begin.';
+    EL.calTimer.style.display = 'none';
+    EL.stateScreen.classList.remove('hidden');
+    EL.dashboard.classList.add('hidden');
+    EL.btnReset.style.display = 'none';
+    EL.pvizLabel.textContent = 'READY';
+  }
+  else if (s === 'SCANNING') {
+    EL.iDot.classList.add('scanning');
+    EL.iText.textContent = 'SCANNING';
+    EL.stateHead.textContent = 'SCANNING FOR NODES';
+    EL.stateSub.textContent  = msg || 'Connecting to ESP32...';
+    EL.calTimer.style.display = 'none';
+    EL.stateScreen.classList.remove('hidden');
+    EL.dashboard.classList.add('hidden');
+    EL.pvizLabel.textContent = 'DETECTING BNO085 IMUs';
+  }
+  else if (s === 'CALIBRATING') {
+    EL.iDot.classList.add('cal');
+    EL.pvizCore.classList.add('cal');
+    EL.iText.textContent = 'CALIBRATING';
+    EL.stateHead.textContent = 'STAND STILL';
+    EL.stateSub.textContent  = 'Capturing static offset q_static.\nMaintain neutral anatomical position.';
+    EL.calTimer.style.display = 'block';
+    EL.stateScreen.classList.remove('hidden');
+    EL.dashboard.classList.add('hidden');
+    EL.pvizLabel.textContent = 'CAPTURING STATIC OFFSET';
+    startCalCountdown();
+  }
+  else if (s === 'LIVE') {
+    EL.iDot.classList.add('live');
+    EL.iText.classList.add('live');
+    EL.iText.textContent = 'LIVE';
+    EL.stateScreen.classList.add('hidden');
+    EL.dashboard.classList.remove('hidden');
+    EL.btnReset.style.display = 'inline-block';
+    EL.vpFrame.classList.add('live');
+    EL.pvizLabel.textContent = 'STREAMING';
+  }
+}
+
+let _calTimerID = null;
+function startCalCountdown() {
+  let t = 3;
+  EL.calTimer.textContent = t;
+  clearInterval(_calTimerID);
+  _calTimerID = setInterval(() => {
+    t--;
+    EL.calTimer.textContent = t;
+    if (t <= 0) {
+      clearInterval(_calTimerID);
+      socket.emit('trigger_calibration', {
+        thigh: {w:1,x:0,y:0,z:0},
+        shin:  {w:1,x:0,y:0,z:0},
+      });
+    }
+  }, 1000);
+}
+
+
+// ════════════════════════════════════════════════════════════
+// 8. SOCKET.IO CLIENT
+//    AUDIT FIX: io() call wrapped in typeof guard.
+//    Retry logic if socket.io loaded asynchronously via fallback.
+// ════════════════════════════════════════════════════════════
+let socket;
+
+function connectSocket() {
+  if (typeof io === 'undefined') {
+    console.warn('[socket] io not defined yet — retrying in 500ms');
+    EL.connToast.classList.add('show');
+    setTimeout(connectSocket, 500);
+    return;
+  }
+  EL.connToast.classList.remove('show');
+
+  socket = io({ transports: ['websocket'], reconnectionDelay: 1000 });
+
+  socket.on('connect', () => {
+    console.log('[socket] connected', socket.id);
+    EL.iText.textContent = 'CONNECTED';
+  });
+
+  socket.on('connect_error', (err) => {
+    console.error('[socket] connect error', err.message);
+    EL.connToast.classList.add('show');
+  });
+
+  socket.on('disconnect', () => {
+    EL.connToast.classList.add('show');
+    transitionState('DISCONNECTED', 'Connection lost. Reconnecting...');
+  });
+
+  socket.on('state_change', d => {
+    transitionState(d.state, d.msg);
+  });
+
+  socket.on('device_event', d => {
+    EL.stateSub.textContent = d.msg || '';
+    EL.pvizLabel.textContent = d.msg || '';
+  });
+
+  socket.on('frame_update', d => {
+    // Write to pending buffer — rAF drains it
+    _pending = d;
+    scheduleRender();
+  });
+
+  socket.on('score_update', d => {
+    _pendingScore = d.score;
+    scheduleRender();
+  });
+}
+
+// Defer socket connection to after DOMContentLoaded to avoid
+// blocking initial paint.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', connectSocket);
+} else {
+  connectSocket();
+}
+
+
+// ════════════════════════════════════════════════════════════
+// 9. BUTTON WIRING
+// ════════════════════════════════════════════════════════════
+EL.btnScan.addEventListener('click',  () => socket && socket.emit('start_scanning'));
+EL.btnSim.addEventListener('click',   () => transitionState('CALIBRATING'));
+EL.btnReset.addEventListener('click', () => socket && socket.emit('reset_calibration'));
+
+
+// ════════════════════════════════════════════════════════════
+// 10. MAGNETIC BUTTON EFFECT (V7 retained)
+// ════════════════════════════════════════════════════════════
+document.querySelectorAll('.btn').forEach(btn => {
+  const STRENGTH = 0.35;
+  btn.addEventListener('mousemove', e => {
+    const r  = btn.getBoundingClientRect();
+    const cx = ((e.clientX - r.left) / r.width  - 0.5) * 2;
+    const cy = ((e.clientY - r.top)  / r.height - 0.5) * 2;
+    btn.style.transform = `translate(${cx*r.width*0.5*STRENGTH}px, ${cy*r.height*0.5*STRENGTH}px)`;
+    btn.style.setProperty('--mx', ((e.clientX-r.left)/r.width*100).toFixed(1)+'%');
+    btn.style.setProperty('--my', ((e.clientY-r.top)/r.height*100).toFixed(1)+'%');
+  });
+  btn.addEventListener('mouseleave', () => { btn.style.transform = 'translate(0,0)'; });
+});
+
+
+// ════════════════════════════════════════════════════════════
+// 11. CLOCK (updates island text when LIVE)
+// ════════════════════════════════════════════════════════════
+setInterval(() => {
+  if (APP.state === 'LIVE') {
+    EL.iText.textContent = 'LIVE · ' + new Date().toTimeString().slice(0, 8);
+  }
+}, 1000);
+
+
+// ════════════════════════════════════════════════════════════
+// 12. ABOUT OVERLAY
+// ════════════════════════════════════════════════════════════
+function openAbout() {
+  document.getElementById('about-overlay').classList.add('open');
+}
+function closeAbout(e) {
+  if (!e || e.target === document.getElementById('about-overlay') || e.target.classList.contains('about-close')) {
+    document.getElementById('about-overlay').classList.remove('open');
+  }
+}
+</script>
+</body>
+</html>

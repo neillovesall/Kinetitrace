@@ -1,0 +1,10 @@
+# Environments
+venv/
+
+# Python cache (targets both the folder and any stray files)
+__pycache__/
+*.pyc
+
+# Specific files and tools
+AllFiles.txt
+scriptcompiler.bat
